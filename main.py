@@ -4,8 +4,10 @@ import pandas as pd
 import numpy as np
 import os
 import logging
+from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ================ 너는 로그야 ================
@@ -13,18 +15,25 @@ logger = logging.getLogger("AutoTradingLogger")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-# CONSOLE HANDLER
+# 핸들러
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# FILE HANDLER (매일 새로운 파일 생성)
-log_filename = datetime.now().strftime("trading_log_%Y%m%d.log")
-file_handler = logging.FileHandler(log_filename)
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+# TimedRotatingFileHandler: 1분마다 회전, backupCount=2 (최신 2회차 이전 로그만 유지)
+trading_handler = TimedRotatingFileHandler("trading_log.log", when="M", interval=1, backupCount=2)
+trading_handler.setLevel(logging.INFO)
+trading_handler.setFormatter(formatter)
+logger.addHandler(trading_handler)
+
+# ================ (buy_sell_log) ================
+buy_sell_logger = logging.getLogger("BuySellLogger")
+buy_sell_logger.setLevel(logging.INFO)
+buy_sell_handler = TimedRotatingFileHandler("buy_sell_log.log", when="M", interval=1, backupCount=2)
+buy_sell_handler.setLevel(logging.INFO)
+buy_sell_handler.setFormatter(formatter)
+buy_sell_logger.addHandler(buy_sell_handler)
 
 # ================ API ================
 API_KEY = os.getenv("ACCESS_KEY")
@@ -34,11 +43,10 @@ upbit = pyupbit.Upbit(API_KEY, API_SECRET)
 # 각 종목별 매수 시 사용할 원화 주문 금액
 ORDER_AMOUNT = float(os.getenv("ORDER_AMOUNT", "5000"))
 
-# ================ 보조용임: 안전하게 현재가 조회 ================
+# ================ 보조 함수, 에러방지용 ================
 def safe_get_current_price(ticker):
     try:
         price = pyupbit.get_current_price(ticker)
-        # price가 None 또는 값이 없을 경우를 확인
         if price is None:
             raise ValueError("가격 데이터 없음")
         return price
@@ -46,7 +54,7 @@ def safe_get_current_price(ticker):
         logger.warning(f"{ticker}: 현재가 조회 오류 - {e}")
         return None
 
-# ================ 여기부터 주요함수야 ================
+# ================ 주요 함수 ================
 def get_top_50_tickers():
     tickers = pyupbit.get_tickers(fiat="KRW")
     top_50 = tickers[:50]
@@ -145,17 +153,17 @@ def manage_portfolio():
                 if signal == "BUY":
                     buy_price = safe_get_current_price(ticker)
                     if buy_price is not None:
-                        # 시장가 매수 주문 실행
                         order = upbit.buy_market_order(ticker, ORDER_AMOUNT)
                         logger.info(f"✅ 신규 진입 주문 요청: {ticker} 주문금액 {ORDER_AMOUNT}원")
+                        buy_sell_logger.info(f"구매 주문 요청: {ticker}, 금액: {ORDER_AMOUNT}원")
                         time.sleep(1)  # 주문 체결 대기
-                        # 잔고 조회하여 매수량 결정
                         quantity = upbit.get_balance(ticker)
                         if quantity is None or quantity <= 0:
                             logger.warning(f"{ticker}: 매수 후 잔고 조회 실패")
                             continue
                         portfolio[ticker] = {"entry_price": buy_price, "quantity": quantity}
                         logger.info(f"✅ 신규 진입 완료: {ticker} at {buy_price}, 수량: {quantity}")
+                        buy_sell_logger.info(f"구매 완료: {ticker}, 가격: {buy_price}, 수량: {quantity}")
     
     # 포트폴리오 정리: 보유 종목이 10개 초과 시, 가장 수익률이 낮은 종목 매도
     if len(portfolio) > 10:
@@ -168,13 +176,13 @@ def manage_portfolio():
         logger.info(f"🚨 포트폴리오 정리: {worst_ticker} 매도 (수익률 최저), 수량: {quantity}")
         order = upbit.sell_market_order(worst_ticker, quantity)
         logger.info(f"🚨 포트폴리오 정리 완료: {worst_ticker} 매도 주문 실행")
+        buy_sell_logger.info(f"매도 (포트폴리오 정리): {worst_ticker}, 수량: {quantity}")
         del portfolio[worst_ticker]
 
 def execute_trading():
     global portfolio
     logger.info("자동매매 실행 시작")
     while True:
-        # 보유 중인 각 종목에 대해 청산 조건 확인
         for ticker in list(portfolio.keys()):
             current_price = safe_get_current_price(ticker)
             entry_price = portfolio[ticker]["entry_price"]
@@ -189,6 +197,7 @@ def execute_trading():
                 logger.info(f"📉 {ticker}: 트레일링 스탑 발동 (입장가: {entry_price}, 현재가: {current_price}) → 매도, 수량: {quantity}")
                 order = upbit.sell_market_order(ticker, quantity)
                 logger.info(f"📉 {ticker}: 매도 주문 실행 완료")
+                buy_sell_logger.info(f"매도 (트레일링 스탑): {ticker}, 수량: {quantity}, 가격: {current_price}")
                 del portfolio[ticker]
                 continue
 
@@ -198,6 +207,7 @@ def execute_trading():
                 logger.info(f"🎯 {ticker}: 목표 수익 도달 (입장가: {entry_price}, 현재가: {current_price}, ATR: {atr}) → 매도, 수량: {quantity}")
                 order = upbit.sell_market_order(ticker, quantity)
                 logger.info(f"🎯 {ticker}: 매도 주문 실행 완료")
+                buy_sell_logger.info(f"매도 (목표 수익률): {ticker}, 수량: {quantity}, 가격: {current_price}")
                 del portfolio[ticker]
                 continue
 
@@ -207,12 +217,13 @@ def execute_trading():
                 logger.info(f"🔄 {ticker}: 반전 신호 감지 → 매도, 수량: {quantity}")
                 order = upbit.sell_market_order(ticker, quantity)
                 logger.info(f"🔄 {ticker}: 매도 주문 실행 완료")
+                buy_sell_logger.info(f"매도 (반전 신호): {ticker}, 수량: {quantity}, 가격: {current_price}")
                 del portfolio[ticker]
 
         # 포트폴리오 신규 진입 및 정리
         manage_portfolio()
         logger.info(f"현재 포트폴리오 상태: {portfolio}")
-        time.sleep(60)  # 1분 간격 실행
+        time.sleep(10)  # 1분 간격 실행
 
 if __name__ == "__main__":
     logger.info("🚀 자동매매 프로그램 시작!")
